@@ -1,0 +1,122 @@
+name: Build, Test, and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.6'
+
+      - name: Run tests
+        run: |
+          echo "Running tests on default architecture..."
+          go test -v ./...
+          echo "Tests completed successfully."
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, darwin]
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21.6'
+
+      - name: Create bin directory
+        run: mkdir -p ./bin
+
+      - name: Build binary
+        run: |
+          echo "Building for ${{ matrix.os }}/ ${{ matrix.arch }}"
+          CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -o ./bin/${{ github.event.repository.name }}-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }} main.go
+
+      - name: List bin directory
+        run: |
+          echo "Files in ./bin:"
+          ls -la ./bin
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: ./bin/${{ github.event.repository.name }}-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, darwin]
+        arch: [amd64, arm64]
+    steps:
+      - name: Check if release already exists
+        id: check_release
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+          https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }})
+          if [ "$response" = "200" ]; then
+            echo "Release already exists for tag: ${{ github.ref_name }}"
+            echo "release_exists=true" >> $GITHUB_ENV
+            # Fetch the release ID and upload_url for the existing release
+            release_data=$(curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                           https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ github.ref_name }})
+            echo "upload_url=$(echo $release_data | jq -r .upload_url)" >> $GITHUB_ENV
+          else
+            echo "release_exists=false" >> $GITHUB_ENV
+          fi
+        shell: bash
+
+      - name: Create GitHub release
+        id: create_release
+        if: env.release_exists == 'false'
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+
+      - name: Set upload URL
+        if: env.release_exists == 'false'
+        run: echo "upload_url=${{ steps.create_release.outputs.upload_url }}" >> $GITHUB_ENV
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./bin
+
+      - name: List downloaded files
+        run: |
+          echo "Files in ./bin after downloading all artifacts:"
+          ls -la ./bin/
+
+      - name: Upload release assets
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ env.upload_url }}
+          asset_path: ./bin/${{ github.event.repository.name }}-${{ matrix.os }}-${{ matrix.arch }}/${{ github.event.repository.name }}-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+          asset_name: ${{ github.event.repository.name }}-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
